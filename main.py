@@ -3,14 +3,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader ,Subset
 from torchvision.transforms import Compose, Normalize, ToTensor
 import torch.optim as optim
+from torchvision import datasets, transforms
 
 from flwr_datasets import FederatedDataset
 from flwr_datasets.partitioner import DirichletPartitioner
 from flwr.common import context
 
+DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cuda:0" if torch.cuda.is_available() else "cpu")
 
 #ResNet50
 class Bottleneck(nn.Module):
@@ -85,7 +87,7 @@ def client_update(client_model, optimizer, train_loader, epoch=5):
     client_model.train()
     for e in range(epoch):
         for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.cuda(), target.cuda()
+            data, target = data.to(DEVICE), target.to(DEVICE)
             optimizer.zero_grad()
             output = client_model(data)
             loss = F.nll_loss(output, target)
@@ -107,7 +109,7 @@ def test(global_model, test_loader):
     correct = 0
     with torch.no_grad():
         for data, target in test_loader:
-            data, target = data.cuda(), target.cuda()
+            data, target = data.to(DEVICE), target.to(DEVICE)
             output = global_model(data)
             test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
             pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
@@ -121,49 +123,86 @@ def test(global_model, test_loader):
 def load_data(partition_id: int, num_partitions: int):
     """Load partition CIFAR10 data."""
     # Only initialize `FederatedDataset` once
-    global fds
-    if fds is None:
-        partitioner = DirichletPartitioner(num_partitions=num_partitions , partition_by="label" , alpha=0.1)
-        fds = FederatedDataset(
-            dataset="uoft-cs/cifar10",
-            partitioners={"train": partitioner},
-        )
-    partition = fds.load_partition(partition_id)
-    # Divide data on each node: 80% train, 20% test
-    partition_train_test = partition.train_test_split(test_size=0.2, seed=42)
-    pytorch_transforms = Compose(
-        [ToTensor(), Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
-    )
+    # global fds
+    # if fds is None:
+    #     partitioner = DirichletPartitioner(num_partitions=num_partitions , partition_by="label" , alpha=0.1)
+    #     fds = FederatedDataset(
+    #         dataset="uoft-cs/cifar10",
+    #         partitioners={"train": partitioner},
+    #     )
+    # partition = fds.load_partition(partition_id)
+    # # Divide data on each node: 80% train, 20% test
+    # partition_train_test = partition.train_test_split(test_size=0.2, seed=42)
+    # pytorch_transforms = Compose(
+    #     [ToTensor(), Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
+    # )
 
-    def apply_transforms(batch):
-        """Apply transforms to the partition from FederatedDataset."""
-        batch["img"] = [pytorch_transforms(img) for img in batch["img"]]
-        return batch
+    # def apply_transforms(batch):
+    #     """Apply transforms to the partition from FederatedDataset."""
+    #     batch["img"] = [pytorch_transforms(img) for img in batch["img"]]
+    #     return batch
 
-    partition_train_test = partition_train_test.with_transform(apply_transforms)
-    trainloader = DataLoader(partition_train_test["train"], batch_size=32, shuffle=True)
-    testloader = DataLoader(partition_train_test["test"], batch_size=32)
-    return trainloader, testloader
-
+    # partition_train_test = partition_train_test.with_transform(apply_transforms)
+    # trainloader = DataLoader(partition_train_test["train"], batch_size=32, shuffle=True)
+    # traindata_split = torch.utils.data.random_split(partition_train_test["train"], [int(traindata.data.shape[0] / num_clients) for _ in range(num_clients)])
+    # testloader = DataLoader(partition_train_test["test"], batch_size=32)
+    # return trainloader, testloader
 num_clients = 100
 num_selected = 5
 num_rounds = 50
 epochs = 5
 batch_size = 32
+num_partitions = 10   
 
-partition_id = context.node_config["partition-id"]
-num_partitions = context.node_config["num-partitions"]
-train_loader, test_loader = load_data(partition_id, num_partitions)
+num_classes_per_client = 2  # for example, 2 classes per client
 
-global_model = ResNet50().cuda()
-client_models = [ResNet50().cuda() for _ in range(num_selected)]
+# Download the CIFAR-10 dataset
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Normalizing CIFAR-10
+])
+
+traindata = datasets.CIFAR10('./data', train=True, download=True, transform=transform)
+
+# Group data by label
+labels = np.array(traindata.targets)
+data_by_class = [np.where(labels == i)[0] for i in range(10)]  # Create an index list for each class (0-9)
+
+# Assign data to clients
+traindata_split = []
+for i in range(num_clients):
+    # Pick `num_classes_per_client` classes randomly (for non-IID distribution)
+    selected_classes = np.random.choice(range(10), num_classes_per_client, replace=False)
+    client_indices = np.concatenate([data_by_class[c] for c in selected_classes])
+    
+    # Shuffle indices and take a subset of the data for this client
+    np.random.shuffle(client_indices)
+    traindata_split.append(Subset(traindata, client_indices))
+
+# Create DataLoaders for each client
+train_loader = [DataLoader(x, batch_size=32, shuffle=True) for x in traindata_split]
+
+# Test loader (can remain the same for evaluation)
+test_loader = DataLoader(
+    datasets.CIFAR10('./data', train=False, transform=transform),
+    batch_size=32, shuffle=True)
+
+
+
+# partition_id = context.node_config["partition-id"]
+
+# train_loader, test_loader = load_data(partition_id, num_partitions)
+
+
+
+global_model = ResNet50().to(DEVICE)
+client_models = [ResNet50().to(DEVICE) for _ in range(num_selected)]
 for model in client_models:
     model.load_state_dict(global_model.state_dict())
 
 opt = [optim.SGD(model.parameters(), lr=0.1) for model in client_models]
 
 # Runnining FL
-
 for r in range(num_rounds):
     # select random clients
     client_idx = np.random.permutation(num_clients)[:num_selected]
